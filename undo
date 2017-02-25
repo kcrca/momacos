@@ -1,0 +1,8 @@
+#!/bin/bash
+
+set -x
+rm -rf ~_minecraft
+launchctl kill TERM system/net.minecraft.server.server
+rm -f /Library/LaunchDaemons/net.minecraft.server.server.plist
+dscl . delete /Users/_minecraft
+dscl . delete /Groups/_minecraft

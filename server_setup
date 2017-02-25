@@ -1,0 +1,164 @@
+#!/bin/bash
+#
+# Set up a minecraft server for OSX.
+# The server will live under ~_minecraft/<server_name>.
+
+show_only=0
+if [[ $1 == -n ]]; then
+    show_only=1
+    shift
+fi
+
+if (( $# != 1 && $# != 2 )); then
+    echo Usage: "$0" [-n] 'directory_of_existing_server [server_name]' 1>&2
+    exit 1
+fi
+
+set -e
+
+if dscl . ls /Groups/_minecraft &>/dev/null; then
+    echo Group '_minecraft' already exists, using it
+else
+    dseditgroup -o create -i 300 _minecraft
+fi
+
+if dscl . ls /Users/_minecraft &>/dev/null; then
+    echo User '_minecraft' already exists, using it
+else
+    dscl . -create /Users/_minecraft UniqueID 300
+    dscl . -create /Users/_minecraft PrimaryGroupID 300
+    dscl . -create /Users/_minecraft NFSHomeDirectory /Users/_minecraft
+    # Use the login shell of the person running the script, since that's what they like
+    dscl . -create /Users/_minecraft UserShell "$SHELL"
+    # Put _minecraft into the group
+    dseditgroup -o edit -a _minecraft -t user _minecraft
+    # Put the person running the script into the group so they can send commands
+    dseditgroup -o edit -a "$SUDO_USER" -t user _minecraft
+    # Prevent the user from showing up in the list of users on the login screen
+    dscl . -delete /Users/_minecraft AuthenticationAuthority
+    # Prevent direct login for this user (all commands vi sudo)
+    dscl . -create /Users/_minecraft Password "*"
+fi
+
+if [[ -d ~_minecraft ]]; then
+    echo Home directory for _minecraft already exists, using it
+else
+    createhomedir -u _minecraft
+fi
+
+src_dir="$1"
+server_name="server"
+if (( $# == 2 )); then
+    server_name="$2"
+fi
+dst_dir=~_minecraft/"$server_name"
+
+umask 022
+
+if [[ -d $dst_dir ]]; then
+    echo Directory "$dst_dir" already exists, using it, ignoring "$src_dir"
+else
+    mkdir -p "$dst_dir"
+    cp -r "$src_dir"/* "$dst_dir"/
+fi
+
+echo Creating "$dst_dir/minecraft.command"
+cat > "$dst_dir/minecraft.command" <<\EOF
+#!/usr/bin/env -i bash
+
+cd $(dirname "$0")
+
+MinecraftServer ()
+{
+        /usr/sbin/ipconfig waitall
+
+        Status "Starting Minecraft server..."
+        
+        # Environment to be passed to Evacuate
+        export MC_SIO # fifo for server i/o
+        export MC_PID # server process id
+        trap Evacuate HUP INT TERM
+        
+        MC_SIO="$PWD/fifo"
+	rm -f "$MC_SIO"
+        mkfifo -m 0660 "$MC_SIO"
+	# use the most recent server jar file
+        java -Xms1G -Xmx1G -jar $(ls -t minecraft_server.*.jar) nogui <>"$MC_SIO" &
+        MC_PID=$!
+        Status "Minecraft PID: ${MC_PID}"
+        wait
+        rm -rf "$MC_SIO"
+        
+        Status "Server has shut down."
+}
+
+Evacuate ()
+{
+        Status "Stopping Minecraft..."
+        echo "stop" >> "$MC_SIO"
+        wait $MC_PID
+        Status "Minecraft has stopped."
+	rm -f $MC_SIO
+}
+
+Status ()
+{
+        # Log messages to syslog so they are visible in Console.app
+        logger -t Minecraft "$@"
+}
+
+MinecraftServer
+EOF
+chmod +x "$dst_dir"/minecraft.command
+
+echo Creating "$dst_dir"/send_mc
+cat > "$dst_dir"/send_mc <<\EOF
+#!/bin/bash
+cd $(dirname "$0")
+if [[ ! -p fifo ]]; then
+    echo 1>&2 "No fifo for server in $PWD (Is the server running?)"
+    exit 1
+fi
+echo "$@" >> fifo
+EOF
+chmod +x "$dst_dir"/send_mc
+
+chown -R _minecraft:_minecraft "$dst_dir"
+chmod -R u=rwX,go=rX "$dst_dir"
+
+service=net.minecraft.server."$server_name"
+echo Creating /Library/LaunchDaemons/"$service".plist
+cat > /Library/LaunchDaemons/"$service".plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC -//Apple Computer//DTD PLIST 1.0//EN http://www.apple.com/DTDs/PropertyList-1.0.dtd >
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+	    <string>net.minecraft.server.$server_name</string>
+    <key>ProgramArguments</key>
+	    <array>
+		<string>./minecraft.command</string>
+	    </array>
+    <key>RunAtLoad</key>
+	    <true/>
+    <key>WorkingDirectory</key>
+	    <string>$dst_dir</string>
+    <key>UserName</key>
+	    <string>_minecraft</string>
+    <key>GroupName</key>
+	    <string>_minecraft</string>
+    <!-- useful to uncomment when debugging
+    <key>StandardErrorPath</key>
+	<string>/tmp/mycommand.err</string>
+    <key>StandardOutPath</key>
+	<string>/tmp/mycommand.out</string>
+    -->
+</dict>
+</plist>
+EOF
+chown root:wheel /Library/LaunchDaemons/"$service".plist
+
+set -x
+launchctl bootstrap system/Library/LaunchDaemons/"$service".plist
+launchctl enable system/"$service"
+launchctl kickstart -k system/"$service"
